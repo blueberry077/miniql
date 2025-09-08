@@ -1,0 +1,6 @@
+bookbase||
+id INT|name CHAR(25)|author CHAR(25)
+0|The Great Quest|Arnold
+1|Purple Sea|Christine
+2|Into the Moon|Arnold
+3|Road to Victory|blueberry
