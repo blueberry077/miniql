@@ -12,7 +12,8 @@
 //     - Column type/size handling
 //     - Row buffer allocation
 //     - Data access functions (set/get)
-//
+//     - PRINT and APPEND ROW commands
+//     - Save output in db.csv
 //
 //
 // ************************************************
@@ -23,6 +24,8 @@
 
 #define MAX_LENGTH  (64)
 #define MAX_COLUMNS (10)
+
+#define WHAT printf("???\n");
 
 typedef enum DB_TYPES {
   TYPE_INT,
@@ -47,6 +50,10 @@ typedef struct Table {
   int row_size;
 } Table;
 
+int get_table_name(Table *table, char *line);
+int get_columns_info(Table *table, char *line);
+int get_row(Table *table, char *line, int row_start);
+
 DB_TYPES type_name_to_type(char *type_name);
 char *type_to_type_name(DB_TYPES type);
 int type_to_sizeof(DB_TYPES type);
@@ -55,10 +62,21 @@ int set_char_array(Table *table, char *value, int offset, int arrsize);
 int get_int(Table *table, int row, int column);
 char *get_char_array(Table *table, int row, int column, int *arrsize);
 
+char *cmd_token(char *ptr, char *buf);
+int PRINT_Command(Table *table);
+
 int main(int argc, char **argv)
 {
   Table tabl;
   char s[1024];
+  
+  if (argc < 2) {
+    printf("error: no CSV database provided.\n");
+    printf("usage: miniql database <Command>\n");
+    printf("Commands:\n");
+    printf("  APPEND ROW (val1, val2, ...)   append a new row at the end of the table.\n");
+    printf("  PRINT                          print the content of the table.\n");
+  }
   
   FILE *f = fopen(argv[1], "r");
   if (!f) {
@@ -67,47 +85,258 @@ int main(int argc, char **argv)
   }
   
   // GET TABLE NAME
-  {
-    fgets(s, sizeof(s)-1, f);
-    
-    char table_name[MAX_LENGTH];
-    char *table_name_ptr = table_name;
-    char *ptr = s;
-    
-    while (*ptr) {
-      while (isspace(*ptr))
-        ptr++;
-      
-      if (isalpha(*ptr)) {
-        while (isalpha(*ptr)) {
-          *table_name_ptr = *ptr;
-          table_name_ptr++;
-          ptr++;
-        }
-        *table_name_ptr = '\0';
-      }
-      ptr++;
-    }
-    
-    strncpy(tabl.name, table_name, sizeof(table_name)-1);
-    printf("table %s\n", tabl.name);
-  }
-  
+  fgets(s, sizeof(s)-1, f);
+  get_table_name(&tabl, s);
+  printf("table %s\n", tabl.name);
   
   // GET COLUMNS INFO
   
   fgets(s, sizeof(s)-1, f);
+  get_columns_info(&tabl, s);
   
-  char *ptr = s;
+  for (int i = 0; i < tabl.col_count; ++i) {
+    printf("column %s type %s count %d offset %d\n",
+      tabl.col[i].name,
+      type_to_type_name(tabl.col[i].type),
+      tabl.col[i].type_count,
+      tabl.col[i].offset
+    );
+  }
+  printf("\n");
+  
+  // ALLOCATE BUFFER
+  
+  tabl.row_buffer = (char*)malloc(0); // can you malloc(0) ?
+  if (!tabl.row_buffer) {
+    fclose(f);
+    return -1;
+  }
+  
+  // GET ROWS
+  
+  int row_start = 0;
+  tabl.table_size = 0;
+  tabl.row_count = 0;
+  while (fgets(s, sizeof(s)-1, f)) {
+    row_start = tabl.table_size;
+    tabl.table_size += tabl.row_size;
+    tabl.row_buffer = (char*)realloc(tabl.row_buffer, tabl.table_size);
+    if (!tabl.row_buffer) {
+      fclose(f);
+      return -1;
+    }
+    get_row(&tabl, s, row_start);
+    tabl.row_count++;
+  }
+  
+  fclose(f);
+  
+  if (argc >= 3) {
+    char buf[32];
+    char *cmd = argv[2];
+    cmd = cmd_token(cmd, buf);
+    
+    if (!strcmp("PRINT", buf)) {
+      PRINT_Command(&tabl);
+    } else
+    if (!strcmp("APPEND", buf)) {
+      cmd = cmd_token(cmd, buf);
+      if (!strcmp("ROW", buf)) {
+        cmd = cmd_token(cmd, buf);
+        if (strcmp("(", buf)) {
+          // failed.
+        }
+        
+        // ALLOCATE SPACE
+        
+        int col = 0;
+        int row = tabl.row_count;
+        tabl.table_size += tabl.row_size;
+        tabl.row_buffer = (char*)realloc(tabl.row_buffer, tabl.table_size);
+        if (!tabl.row_buffer) {
+          fclose(f);
+          return -1;
+        }
+        tabl.row_count++;
+        
+        // ADD VALUES
+        
+        cmd = cmd_token(cmd, buf);
+        while (1) {
+          int offset = row * tabl.row_size + tabl.col[col].offset;
+          DB_TYPES type = tabl.col[col].type;
+          
+          if (type == TYPE_INT) {
+            set_int(&tabl, atoi(buf), offset);
+          } else
+          if (type == TYPE_CHAR) {
+            if (tabl.col[col].type_count > 1) {
+              set_char_array(&tabl, buf, offset, tabl.col[col].type_count);
+            }
+          }
+          
+          cmd = cmd_token(cmd, buf);
+          if (!strcmp(")", buf)) {
+            break;
+          }
+          if (strcmp(",", buf)) {
+            // failed. expected ','
+          }
+          cmd = cmd_token(cmd, buf);
+          col++;
+        }
+        
+        PRINT_Command(&tabl);
+      }
+    }
+  }
+  
+  // SAVE THE DATABASE
+  
+  FILE *fout = fopen("db.csv", "w");
+  if (!f) {
+    goto cleanup;
+  }
+  
+  fprintf(fout, "%s", tabl.name);
+  for (int j = 0; j < tabl.col_count-1; ++j) {
+    fprintf(fout, "|");
+  }
+  fprintf(fout, "\n");
+  
+  for (int j = 0; j < tabl.col_count; ++j) {
+    fprintf(fout, "%s %s", tabl.col[j].name, type_to_type_name(tabl.col[j].type));
+    if (tabl.col[j].type_count > 1) {
+      fprintf(fout, "(%d)", tabl.col[j].type_count);
+    }
+    if (j < tabl.col_count-1) {
+      fprintf(fout, "|");
+    }
+  }
+  fprintf(fout, "\n");
+  
+  for (int i = 0; i < tabl.row_count; ++i) {
+    for (int j = 0; j < tabl.col_count; ++j) {
+      if (tabl.col[j].type == TYPE_INT) {
+        int value = get_int(&tabl, i, j);
+        fprintf(fout, "%d", value);
+      } else
+      if (tabl.col[j].type == TYPE_CHAR) {
+        if (tabl.col[j].type_count > 1) {
+          int arrsize;
+          char *value = get_char_array(&tabl, i, j, &arrsize);
+          fprintf(fout, "%s", value);
+        } else {
+          fprintf(fout, "%c", 'A');
+        }
+      }
+      if (j < tabl.col_count-1) {
+        fprintf(fout, "|");
+      }
+    }
+    fprintf(fout, "\n");
+  }
+  
+  // bookbase||
+  // id INT|name CHAR(25)|author CHAR(25)
+  // 0|The Great Quest|Arnold
+  // 1|Purple Sea|Christine
+  // 2|Into the Moon|Arnold
+  // 3|Road to Victory|blueberry
+
+  
+  fclose(f);
+ 
+cleanup:
+  printf("tabl.table_size = %d\n", tabl.table_size);
+  free(tabl.row_buffer);
+  return 0;
+}
+
+int get_table_name(Table *table, char *line)
+{
+  char table_name[MAX_LENGTH] = {'\0'};
+  char *table_name_ptr = table_name;
+  char *ptr = line;
+  
+  while (*ptr) {
+    while (isspace(*ptr))
+      ptr++;
+    
+    if (isalpha(*ptr)) {
+      while (isalpha(*ptr)) {
+        *table_name_ptr = *ptr;
+        table_name_ptr++;
+        ptr++;
+      }
+      *table_name_ptr = '\0';
+    }
+    ptr++;
+  }
+  
+  strncpy(table->name, table_name, sizeof(table_name)-1);
+  return 0;
+}
+
+#define set_char(buf, ch) *buf=ch; *(buf+1)='\0'
+char *cmd_token(char *ptr, char *buf)
+{
+  while (isspace(*ptr)) {
+    ptr++;
+  }
+  
+  if (!*ptr)
+    return NULL;
+  
+  if (isalpha(*ptr)) {
+    int i = 0;
+    while (isalpha(*ptr)) {
+      buf[i] = *ptr;
+      ptr++;
+      i++;
+    }
+    buf[i] = '\0';
+    return ptr;
+  }
+  
+  if (isdigit(*ptr)) {
+    int i = 0;
+    while (isdigit(*ptr)) {
+      buf[i++] = *ptr;
+      ptr++;
+    }
+    buf[i] = '\0';
+    return ptr;
+  }
+  
+  if (*ptr == '"') {
+    int i = 0;
+    ptr++;
+    while (*ptr != '"') {
+      buf[i++] = *ptr;
+      ptr++;
+    }
+    ptr++; // skip '"'
+    buf[i] = '\0';
+    return ptr;
+  }
+  
+  set_char(buf, *ptr);
+  return ptr+1;
+}
+
+int get_columns_info(Table *table, char *line)
+{
+  char *ptr = line;
   char name[MAX_LENGTH] = {'\0'};
   char type_name[MAX_LENGTH] = {'\0'};
   int type_count = 1;
   char *name_ptr = name;
   int done = 0;
   int state = 0; // 0=name, 1=type_name
-  
-  tabl.row_size = 0;
-  tabl.col_count = 0;
+
+  table->row_size = 0;
+  table->col_count = 0;
   while (!done) {
     while (isspace(*ptr)) {
       ptr++;
@@ -124,13 +353,13 @@ int main(int argc, char **argv)
       state = 1;
     }
     if (*ptr == '|' || !*ptr) {
-      Column *col = &tabl.col[tabl.col_count];
+      Column *col = &table->col[table->col_count];
       strncpy(col->name, name, sizeof(col->name));
       col->type = type_name_to_type(type_name);
       col->type_count = type_count;
-      col->offset = tabl.row_size;
-      tabl.col_count++;
-      tabl.row_size += type_to_sizeof(col->type) * col->type_count;
+      col->offset = table->row_size;
+      table->col_count++;
+      table->row_size += type_to_sizeof(col->type) * col->type_count;
       
       // Reset
       name_ptr = name;
@@ -166,112 +395,41 @@ int main(int argc, char **argv)
     }
     ptr++;
   }
+}
+
+int get_row(Table *table, char *line, int row_start)
+{
+  char buf[MAX_LENGTH] = {'\0'};
+  char *ptr = NULL;
+  int col_index = 0;
   
-  for (int i = 0; i < tabl.col_count; ++i) {
-    printf("column %s type %s count %d offset %d\n",
-      tabl.col[i].name,
-      type_to_type_name(tabl.col[i].type),
-      tabl.col[i].type_count,
-      tabl.col[i].offset
-    );
-  }
-  printf("\n");
-  
-  // ALLOCATE BUFFER
-  
-  tabl.row_buffer = (char*)malloc(1); // can you malloc(0) ?
-  if (!tabl.row_buffer) {
-    fclose(f);
-    return -1;
-  }
-  tabl.table_size = 0;
-  
-  // GET ROWS
-  
-  {
-    char _s[256];
-    char buf[MAX_LENGTH] = {'\0'};
-    char *ptr = NULL;
-    int row_start = 0;
-    // int row_index = 0;
+  // get values
+  ptr = line;
+  while (*ptr) {
+    char *buf_ptr = buf;
+    while (*ptr != '|' && *ptr != '\n') {
+      *buf_ptr = *ptr;
+      buf_ptr++;
+      ptr++;
+    }
+    *buf_ptr = '\0';
     
-    tabl.row_count = 0;
-    while (fgets(_s, sizeof(_s)-1, f)) {
-      int col_index = 0;
-      
-      tabl.row_count++;
-      row_start = tabl.table_size;
-      tabl.table_size += tabl.row_size;
-      tabl.row_buffer = (char*)realloc(tabl.row_buffer, tabl.table_size);
-      if (!tabl.row_buffer) {
-        fclose(f);
-        return -1;
-      }
-      
-      // get values
-      ptr = _s;
-      while (*ptr) {
-        char *buf_ptr = buf;
-        while (*ptr != '|' && *ptr != '\n') {
-          *buf_ptr = *ptr;
-          buf_ptr++;
-          ptr++;
-        }
-        *buf_ptr = '\0';
-        // printf("buf=%s\n", buf);
-        
-        // add value
-        
-        int offset = row_start + tabl.col[col_index].offset;
-        DB_TYPES type = tabl.col[col_index].type;
-        
-        if (type == TYPE_INT) {
-          set_int(&tabl, atoi(buf), offset);
-        } else
-        if (type == TYPE_CHAR) {
-          if (tabl.col[col_index].type_count > 1) {
-            set_char_array(&tabl, buf, offset, tabl.col[col_index].type_count);
-          }
-        }
-        
-        col_index++;
-        ptr++;
+    // add value
+    int offset = row_start + table->col[col_index].offset;
+    DB_TYPES type = table->col[col_index].type;
+    
+    if (type == TYPE_INT) {
+      set_int(table, atoi(buf), offset);
+    } else
+    if (type == TYPE_CHAR) {
+      if (table->col[col_index].type_count > 1) {
+        set_char_array(table, buf, offset, table->col[col_index].type_count);
       }
     }
+    
+    col_index++;
+    ptr++;
   }
-  
-  fclose(f);
-  
-  // Read table
-  
-  for (int j = 0; j < tabl.col_count; ++j) {
-    printf("%25s ", tabl.col[j].name);
-  }
-  printf("\n");
-  
-  for (int i = 0; i < tabl.row_count; ++i) {
-    for (int j = 0; j < tabl.col_count; ++j) {
-      if (tabl.col[j].type == TYPE_INT) {
-        int value = get_int(&tabl, i, j);
-        printf("%25d ", value);
-      } else
-      if (tabl.col[j].type == TYPE_CHAR) {
-        if (tabl.col[j].type_count > 1) {
-          int arrsize;
-          char *value = get_char_array(&tabl, i, j, &arrsize);
-          printf("%25.*s ", arrsize, value);
-        } else {
-          printf("%25c ", 'A');
-        }
-      }
-    }
-    printf("\n");
-  }
-  
-  //
-  
-  printf("tabl.table_size = %d\n", tabl.table_size);
-  free(tabl.row_buffer);
   return 0;
 }
 
@@ -335,4 +493,33 @@ char *get_char_array(Table *table, int row, int column, int *arrsize)
   char *ptr = (char*)(table->row_buffer + offset);
   *arrsize = table->col[column].type_count;
   return ptr;
+}
+
+// ======================================
+
+int PRINT_Command(Table *table)
+{
+  for (int j = 0; j < table->col_count; ++j) {
+    printf("%25s ", table->col[j].name);
+  }
+  printf("\n");
+  
+  for (int i = 0; i < table->row_count; ++i) {
+    for (int j = 0; j < table->col_count; ++j) {
+      if (table->col[j].type == TYPE_INT) {
+        int value = get_int(table, i, j);
+        printf("%25d ", value);
+      } else
+      if (table->col[j].type == TYPE_CHAR) {
+        if (table->col[j].type_count > 1) {
+          int arrsize;
+          char *value = get_char_array(table, i, j, &arrsize);
+          printf("%25.*s ", arrsize, value);
+        } else {
+          printf("%25c ", 'A');
+        }
+      }
+    }
+    printf("\n");
+  }
 }
