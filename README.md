@@ -23,8 +23,8 @@ miniql database <Command>
 ### Examples
 
 ```bash
-miniql books.csv PRINT
-miniql books.csv "APPEND ROW (John, 25, john@example.com)"
+miniql users.csv PRINT
+miniql users.csv "APPEND ROW (John, 25, john@example.com)"
 ```
 
 ## Future Improvements
